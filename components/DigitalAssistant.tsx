@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { ArrowUpRight, Send, RotateCcw, Check, Mail } from "lucide-react";
 
@@ -15,19 +15,19 @@ interface ChatMessage {
 const QUICK_PROMPTS = [
   {
     label: "Restoran & Menü Sistemi",
-    prompt: "Restoranımız için dijital menü ve web sistemi arıyoruz. Örnek çalışmanız ve fiyatlarınız nedir?",
+    prompt: "Restoranımız için dijital menü ve web sistemi arıyoruz. Örnek çalışmanız var mı?",
   },
   {
     label: "Güzellik & Klinik",
-    prompt: "Güzellik merkezi / klinik için kurumsal sistem ve randevu altyapısı hakkında bilgi alabilir miyim?",
+    prompt: "Güzellik merkezi ve klinik üzerine örnek sisteminizi inceleyebilir miyim?",
   },
   {
     label: "Eğitim & Danışmanlık",
-    prompt: "Eğitim ve danışmanlık üzerine çalışan bir sistem örneğiniz ve fiyat aralığınız nedir?",
+    prompt: "Eğitim ve danışmanlık üzerine çalışan aktif sistem örneğiniz nedir?",
   },
   {
-    label: "Fiyatlandırma & Kampanya",
-    prompt: "Sistemlerinizin fiyat aralıkları, ilk yıl kampanyanız ve süreç hakkında bilgi alabilir miyim?",
+    label: "Fiyatlandırma & Süreç",
+    prompt: "Sistemlerinizin fiyatlandırma politikası ve çalışma süreciniz nasıldır?",
   },
 ];
 
@@ -46,8 +46,12 @@ export function DigitalAssistant() {
   const [leadCaptured, setLeadCaptured] = useState(false);
 
   const chatContainerRef = useRef<HTMLDivElement>(null);
+  const messagesRef = useRef<ChatMessage[]>(messages);
+  const lastSentCountRef = useRef<number>(1); // Başlangıç mesajı (1) gönderilmez
+  const capturedPhoneRef = useRef<string>("");
 
   useEffect(() => {
+    messagesRef.current = messages;
     if (chatContainerRef.current) {
       chatContainerRef.current.scrollTo({
         top: chatContainerRef.current.scrollHeight,
@@ -55,6 +59,65 @@ export function DigitalAssistant() {
       });
     }
   }, [messages, isTyping]);
+
+  // Sohbeti tek seferde Telegram'a gönderen fonksiyon
+  const flushChatToTelegram = useCallback((reason: string, useBeacon = false) => {
+    const currentMsgs = messagesRef.current;
+    // Kullanıcı en az 1 mesaj yazmadıysa veya son halini zaten gönderdiysek çık
+    if (currentMsgs.length <= 1 || currentMsgs.length <= lastSentCountRef.current) {
+      return;
+    }
+
+    lastSentCountRef.current = currentMsgs.length;
+
+    const payload = JSON.stringify({
+      conversation: currentMsgs
+        .slice(1) // İlk sabit karşılama cümlesini kalabalık yapmasın diye atla
+        .map((m) => `${m.sender === "user" ? "👤 Müşteri" : "🤖 NOVA"}: ${m.text}`)
+        .join("\n\n"),
+      hasPhone: Boolean(capturedPhoneRef.current),
+      phone: capturedPhoneRef.current,
+      reason,
+    });
+
+    if (useBeacon && typeof navigator !== "undefined" && navigator.sendBeacon) {
+      const blob = new Blob([payload], { type: "application/json" });
+      navigator.sendBeacon("/api/telegram", blob);
+    } else {
+      fetch("/api/telegram", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: payload,
+        keepalive: true,
+      }).catch(() => {});
+    }
+  }, []);
+
+  // 1. TETİKLEYİCİ: Kullanıcı son mesajdan sonra 90 saniye boyunca hiçbir şey yazmazsa gönder
+  useEffect(() => {
+    if (messages.length <= 1 || isTyping) return;
+
+    const inactivityTimer = setTimeout(() => {
+      flushChatToTelegram("Ziyaretçi sohbeti tamamladı (90 sn hareketsizlik)");
+    }, 90000);
+
+    return () => clearTimeout(inactivityTimer);
+  }, [messages, isTyping, flushChatToTelegram]);
+
+  // 2. TETİKLEYİCİ: Kullanıcı sekmeyi veya tarayıcıyı kapatırsa anında gönder
+  useEffect(() => {
+    const handlePageExit = () => {
+      flushChatToTelegram("Ziyaretçi siteden ayrıldı / sekmeyi kapattı", true);
+    };
+
+    window.addEventListener("pagehide", handlePageExit);
+    window.addEventListener("beforeunload", handlePageExit);
+
+    return () => {
+      window.removeEventListener("pagehide", handlePageExit);
+      window.removeEventListener("beforeunload", handlePageExit);
+    };
+  }, [flushChatToTelegram]);
 
   const detectProjectLinks = (text: string) => {
     const links: { label: string; url: string; type: string }[] = [];
@@ -84,11 +147,12 @@ export function DigitalAssistant() {
     return links.length > 0 ? links : undefined;
   };
 
-  // Kullanıcı telefon numarası bıraktığında tüm sohbeti tek seferde gönderir
+  // MEVCUT EXCEL & MAİL SİSTEMİ (HİÇ DOKUNULMADI - SADECE NUMARA BIRAKILINCA ÇALIŞIR)
   const checkAndSendLead = async (userText: string, history: ChatMessage[]) => {
     const digits = userText.replace(/\D/g, "");
     if (digits.length >= 10 && digits.length <= 13 && !leadCaptured) {
       setLeadCaptured(true);
+      capturedPhoneRef.current = userText;
       try {
         await fetch("/api/lead", {
           method: "POST",
@@ -149,7 +213,14 @@ export function DigitalAssistant() {
         showContact: Boolean(data.showContactButtons),
       };
 
-      setMessages((prev) => [...prev, assistantMsg]);
+      const finalMessages = [...updatedMessages, assistantMsg];
+      setMessages(finalMessages);
+      messagesRef.current = finalMessages;
+
+      // Eğer kullanıcı bu mesajda telefon numarası bıraktıysa NOVA yanıtladıktan hemen sonra Telegram'a da gönder
+      if (capturedPhoneRef.current && lastSentCountRef.current < finalMessages.length) {
+        flushChatToTelegram("Müşteri telefon numarasını bıraktı");
+      }
     } catch {
       setMessages((prev) => [
         ...prev,
@@ -171,7 +242,11 @@ export function DigitalAssistant() {
   };
 
   const handleReset = () => {
+    // Sıfırlamadan önce gönderilmemiş sohbet varsa Telegram'a ilet
+    flushChatToTelegram("Ziyaretçi sohbeti sıfırladı");
     setLeadCaptured(false);
+    capturedPhoneRef.current = "";
+    lastSentCountRef.current = 1;
     setMessages([
       {
         id: `welcome-${Date.now()}`,
